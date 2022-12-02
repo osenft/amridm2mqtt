@@ -17,13 +17,29 @@ import time
 import paho.mqtt.publish as publish
 import settings
 
+
+def kill_subprocs():
+    debug_print('Caught signal, shutting down')
+    try:
+        debug_print('Shutting down rtlamr')
+        rtlamr.send_signal(15)
+        time.sleep(1)
+        debug_print('Killing rtlamr')
+        rtlamr.send_signal(9)
+    except Exception as e:
+        debug_print('Could not shut down rtlamr: {}'.format(e))
+    try:
+        debug_print('Shutting down rtltcp')
+        os.killpg(os.getpgid(rtltcp.pid), signal.SIGTERM)
+        time.sleep(1)
+        debug_print('Killing rtltcp')
+        os.killpg(os.getpgid(rtltcp.pid), signal.SIGKILL)
+    except Exception as e:
+        debug_print('Could not shut down rtltcp: {}'.format(e))
+
 # uses signal to shutdown and hard kill opened processes and self
 def shutdown(signum, frame):
-    rtltcp.send_signal(15)
-    rtlamr.send_signal(15)
-    time.sleep(1)
-    rtltcp.send_signal(9)
-    rtlamr.send_signal(9)
+    kill_subprocs()
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, shutdown)
@@ -56,44 +72,58 @@ def send_mqtt(topic, payload,):
     except Exception as ex:
         print("MQTT Publish Failed: " + str(ex))
 
-# start the rtl_tcp program
-rtltcp = subprocess.Popen([settings.RTL_TCP + " > /dev/null 2>&1 &"], shell=True,
-    stdin=None, stdout=None, stderr=None, close_fds=True)
-time.sleep(5)
+def run():
+    global rtltcp
+    global rtlamr
 
-# start the rtlamr program.
-rtlamr_cmd = [settings.RTLAMR, '-msgtype=scm,r900', '-format=csv']
-rtlamr = subprocess.Popen(rtlamr_cmd, stdout=subprocess.PIPE, universal_newlines=True)
+    # start the rtl_tcp program
+    rtltcp = subprocess.Popen([settings.RTL_TCP + " >>/var/log/rtl_tcp.log 2>&1 &"], shell=True,
+        stdin=None, stdout=None, stderr=None, close_fds=True, preexec_fn=os.setsid)
+    time.sleep(5)
+
+    # start the rtlamr program.
+    rtlamr_cmd = [settings.RTLAMR, '-msgtype=scm,r900', '-format=csv']
+    rtlamr = subprocess.Popen(rtlamr_cmd, stdout=subprocess.PIPE, universal_newlines=True)
+
+    while True:
+        try:
+            amrline = rtlamr.stdout.readline().strip()
+            if rtlamr.poll() is not None:
+                debug_print('rtlamr exited. Quitting')
+                break
+            # debug_print('Received line: "{}"'.format(amrline))
+            flds = amrline.split(',')
+
+            # Fields:
+            #       0    1      2      3  4     5         6         7           8
+            # SCM : Date,Offset,Length,ID,Type ,TamperPhy,TamperEnc,Consumption,CRC
+            # R900: Date,Offset,Length,ID,Unkn1,NoUse    ,BackFlow ,Consumption,Unkn3,Leak,LeakNow
+
+            if len(flds) != 9 and len(flds) != 11:
+                # SCM results have 9 fields
+                # R900 results have 11 fields
+                continue
+
+            # make sure the meter id is one we want
+            meter_id = int(flds[3])
+            if settings.WATCHED_METERS and meter_id not in settings.WATCHED_METERS:
+                continue
+
+            # get some required info: current meter reading, current interval id, most recent interval usage
+            read_cur = int(flds[7])
+
+            current_reading_in_kwh = (read_cur * settings.WH_MULTIPLIER) / 1000
+
+            debug_print('Sending meter {} reading: {}'.format(meter_id, current_reading_in_kwh))
+            send_mqtt('readings/{}/meter_reading'.format(meter_id), str(current_reading_in_kwh))
+
+        except Exception as e:
+            debug_print('Exception squashed! {}: {}', e.__class__.__name__, e)
+            time.sleep(2)
 
 while True:
-    try:
-        amrline = rtlamr.stdout.readline().strip()
-        #debug_print('Received line: "{}"'.format(amrline))
-        flds = amrline.split(',')
+    debug_print('Starting ...')
+    run()
+    debug_print('run ended')
+    kill_subprocs()
 
-        # Fields:
-        #       0    1      2      3  4     5         6         7           8
-        # SCM : Date,Offset,Length,ID,Type ,TamperPhy,TamperEnc,Consumption,CRC
-        # R900: Date,Offset,Length,ID,Unkn1,NoUse    ,BackFlow ,Consumption,Unkn3,Leak,LeakNow
-
-        if len(flds) != 9 and len(flds) != 11:
-            # SCM results have 9 fields
-            # R900 results have 11 fields
-            continue
-
-        # make sure the meter id is one we want
-        meter_id = int(flds[3])
-        if settings.WATCHED_METERS and meter_id not in settings.WATCHED_METERS:
-            continue
-
-        # get some required info: current meter reading, current interval id, most recent interval usage
-        read_cur = int(flds[7])
-
-        current_reading_in_kwh = (read_cur * settings.WH_MULTIPLIER) / 1000
-
-        debug_print('Sending meter {} reading: {}'.format(meter_id, current_reading_in_kwh))
-        send_mqtt('readings/{}/meter_reading'.format(meter_id), str(current_reading_in_kwh))
-
-    except Exception as e:
-        debug_print('Exception squashed! {}: {}', e.__class__.__name__, e)
-        time.sleep(2)
